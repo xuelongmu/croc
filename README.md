@@ -483,6 +483,22 @@ For faster hashing, use the `imohash` algorithm:
 croc send --hash imohash SOMEFILE
 ```
 
+#### Survive Long Connection Drops
+
+If the connection drops mid-transfer, croc reconnects automatically and
+resumes where it left off. By default, each side keeps retrying for 2 minutes
+after a connection loss. For large transfers over an unreliable link, extend
+the window on both the sender and the receiver:
+
+```bash
+croc --reconnect-window 30m send SOMEFOLDER
+croc --reconnect-window 30m <codephrase>
+```
+
+The window restarts after every successful reconnect, so a transfer can
+survive any number of separate drops. You can also set
+`CROC_RECONNECT_WINDOW=30m`.
+
 #### Clipboard Options
 
 By default, the code phrase is copied to your clipboard. To disable this:

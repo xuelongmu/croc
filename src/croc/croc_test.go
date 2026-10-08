@@ -29,6 +29,7 @@ import (
 	"github.com/schollz/croc/v11/src/tcp"
 	"github.com/schollz/peerdiscovery"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReceiveControlFrameSkipsRelayKeepalives(t *testing.T) {
@@ -2262,14 +2263,130 @@ func TestReconnectRetryEligibility(t *testing.T) {
 		nextReconnectRoom:    "next-room",
 		stop:                 newStop(context.Background()),
 	}
-	assert.True(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}, 0))
-	assert.False(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}, maxReconnectAttempts))
-	assert.False(t, c.canRetryTransfer(fmt.Errorf("local file error"), 0))
+	assert.True(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}))
+	assert.False(t, c.canRetryTransfer(fmt.Errorf("local file error")))
 	c.nextReconnectRoom = ""
-	assert.False(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}, 0))
+	assert.False(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}))
 	c.nextReconnectRoom = "next-room"
 	c.peerReconnectVersion = 0
-	assert.False(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}, 0))
+	assert.False(t, c.canRetryTransfer(transferDisconnectError{err: fmt.Errorf("EOF")}))
+}
+
+func reconnectWindowTestClient(window time.Duration) *Client {
+	return &Client{
+		Options:              Options{IsSender: true, RoomName: "room", ReconnectWindow: window},
+		reconnectVersion:     ReconnectVersion,
+		peerReconnectVersion: ReconnectVersion,
+		nextReconnectRoom:    "next-room",
+		stop:                 newStop(context.Background()),
+		receiveMutex:         &sync.Mutex{},
+	}
+}
+
+func TestReconnectWindowDefault(t *testing.T) {
+	assert.Equal(t, DefaultReconnectWindow, (&Client{}).reconnectWindow())
+	assert.Equal(t, 30*time.Minute, (&Client{Options: Options{ReconnectWindow: 30 * time.Minute}}).reconnectWindow())
+}
+
+func TestReconnectRetriesFailedAttemptsUntilWindowExpires(t *testing.T) {
+	const window = 500 * time.Millisecond
+	c := reconnectWindowTestClient(window)
+	attempts := 0
+	started := time.Now()
+	err := c.transferWithReconnect(func(attempt int) error {
+		attempts++
+		if attempt == 0 {
+			return transferDisconnectError{err: errors.New("connection reset")}
+		}
+		return transferDisconnectError{err: errors.New("relay unreachable")}
+	})
+	elapsed := time.Since(started)
+
+	require.Error(t, err)
+	assert.True(t, isTransferDisconnectError(err), "give-up error should still classify as a disconnect: %v", err)
+	assert.Contains(t, err.Error(), "could not reconnect within "+window.String())
+	assert.Contains(t, err.Error(), "connection reset")
+	assert.Greater(t, attempts, 2, "failed reconnect attempts should be retried")
+	assert.GreaterOrEqual(t, elapsed, window)
+}
+
+func TestReconnectWindowRestartsAfterChannelIsResecured(t *testing.T) {
+	// Every reconnect re-secures the channel before dropping again, so each
+	// drop is a fresh outage. The attempts together outlast one window but
+	// must not exhaust it.
+	const window = 250 * time.Millisecond
+	c := reconnectWindowTestClient(window)
+	terminal := errors.New("peer rejected transfer")
+	attempts := 0
+	started := time.Now()
+	err := c.transferWithReconnect(func(attempt int) error {
+		attempts++
+		if attempt == 0 {
+			return transferDisconnectError{err: errors.New("connection reset")}
+		}
+		if attempt == 4 {
+			return terminal
+		}
+		c.updateLifecycle(func(state *transferLifecycle) { state.ChannelSecured = true })
+		return transferDisconnectError{err: errors.New("connection reset again")}
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reconnect attempt 4 failed: "+terminal.Error())
+	assert.Equal(t, 5, attempts)
+	assert.Greater(t, time.Since(started), window, "test must span more than one window to prove the restart")
+}
+
+func TestReconnectStopsOnNonRetryableAttemptFailure(t *testing.T) {
+	c := reconnectWindowTestClient(time.Minute)
+	terminal := errors.New("missing relay control address")
+	attempts := 0
+	err := c.transferWithReconnect(func(attempt int) error {
+		attempts++
+		if attempt == 0 {
+			return transferDisconnectError{err: errors.New("connection reset")}
+		}
+		return terminal
+	})
+
+	assert.Equal(t, 2, attempts)
+	assert.True(t, isTransferDisconnectError(err))
+	assert.Contains(t, err.Error(), "reconnect attempt 1 failed: missing relay control address")
+}
+
+func TestReconnectAttemptWatchdogClosesUnsecuredConnection(t *testing.T) {
+	left, right := net.Pipe()
+	defer right.Close()
+	c := &Client{conn: []*comm.Comm{comm.New(left)}}
+	c.watchReconnectAttempt(time.Now().Add(20 * time.Millisecond))
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := c.connection(0).Receive()
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		assert.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not close the unsecured reconnect connection")
+	}
+}
+
+func TestReconnectAttemptWatchdogKeepsSecuredConnection(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	c := &Client{conn: []*comm.Comm{comm.New(left)}}
+	c.updateLifecycle(func(state *transferLifecycle) { state.ChannelSecured = true })
+	timer := c.watchReconnectAttempt(time.Now().Add(10 * time.Millisecond))
+	defer timer.Stop()
+	time.Sleep(50 * time.Millisecond)
+
+	go func() { _ = comm.New(right).Send([]byte("still open")) }()
+	got, err := c.connection(0).Receive()
+	require.NoError(t, err)
+	assert.Equal(t, []byte("still open"), got)
 }
 
 func TestRelayCapabilityFollowsCommittedRoute(t *testing.T) {
@@ -2351,6 +2468,44 @@ func TestReconnectFallsBackToRememberedRelay(t *testing.T) {
 	assert.Equal(t, relayAddress, receiver.relayControlAddress)
 	assert.Equal(t, relayAddress, sender.Options.RelayAddress)
 	assert.Equal(t, relayAddress, receiver.Options.RelayAddress)
+}
+
+func TestReconnectAttemptFailuresAreRetryable(t *testing.T) {
+	controlPort, stopRelay := startReconnectRelay(t)
+	defer stopRelay()
+	relayAddress := net.JoinHostPort("127.0.0.1", controlPort)
+	newSender := func(t *testing.T, route string) *Client {
+		t.Helper()
+		sender, err := newTestClient(Options{
+			IsSender:       true,
+			SharedSecret:   fmt.Sprintf("retryable-%d", time.Now().UnixNano()),
+			RelayAddress:   relayAddress,
+			RelayPassword:  "pass123",
+			NoPrompt:       true,
+			DisableLocal:   true,
+			Curve:          "siec",
+			NoMultiplexing: true,
+		})
+		if err != nil {
+			t.Fatalf("create sender: %v", err)
+		}
+		sender.nextReconnectRoom = fmt.Sprintf("retryable-room-%d", time.Now().UnixNano())
+		sender.setRelayControlRoute(route, "", false)
+		return sender
+	}
+
+	t.Run("relay unreachable", func(t *testing.T) {
+		sender := newSender(t, net.JoinHostPort("127.0.0.1", freeTestPort(t)))
+		err := sender.senderReconnectRelayAttempt(1)
+		require.Error(t, err)
+		assert.True(t, isTransferDisconnectError(err), "unreachable relay should be retried: %v", err)
+	})
+	t.Run("peer has not rejoined yet", func(t *testing.T) {
+		sender := newSender(t, relayAddress)
+		err := sender.senderReconnectRelayAttempt(1)
+		require.Error(t, err)
+		assert.True(t, isTransferDisconnectError(err), "missing peer should be retried: %v", err)
+	})
 }
 
 func TestSenderWaitsPastAlternateRouteTimeoutAfterRouteIsReady(t *testing.T) {

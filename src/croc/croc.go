@@ -72,10 +72,17 @@ func decryptLocalProbePayload(key, ciphertext []byte) ([]byte, error) {
 }
 
 const (
-	ReconnectVersion                   = 1
-	maxReconnectAttempts               = 10
+	ReconnectVersion = 1
+	// DefaultReconnectWindow bounds how long a transfer keeps retrying after
+	// a single connection loss when Options.ReconnectWindow is unset.
+	DefaultReconnectWindow             = 2 * time.Minute
 	reconnectCandidateHandshakeTimeout = 2 * time.Second
-	maxDecompressedChunkSize           = models.TCP_BUFFER_SIZE/2 + 8
+	// reconnectSecureTimeout bounds how long one reconnect attempt may wait
+	// to re-secure the channel, so a peer parked in a dead relay room (for
+	// example over a half-open connection) rejoins instead of waiting out
+	// the whole reconnect window.
+	reconnectSecureTimeout   = 30 * time.Second
+	maxDecompressedChunkSize = models.TCP_BUFFER_SIZE/2 + 8
 )
 
 func init() {
@@ -129,6 +136,10 @@ type Options struct {
 	DisableClipboard  bool
 	ExtendedClipboard bool
 	Transport         TransportMode `json:",omitempty"`
+	// ReconnectWindow is how long to keep retrying after a connection loss
+	// before giving up. Zero uses DefaultReconnectWindow. The window restarts
+	// after every successful reconnect.
+	ReconnectWindow time.Duration `json:",omitempty"`
 }
 
 // TransportMode controls how a sender selects the file-data connection after
@@ -706,11 +717,15 @@ func (c *Client) waitForExternalIP() {
 	}
 }
 
-func (c *Client) canRetryTransfer(err error, attempt int) bool {
-	if err == nil || c.lifecycleSnapshot().Successful {
-		return false
+func (c *Client) reconnectWindow() time.Duration {
+	if c.Options.ReconnectWindow > 0 {
+		return c.Options.ReconnectWindow
 	}
-	if attempt >= maxReconnectAttempts {
+	return DefaultReconnectWindow
+}
+
+func (c *Client) canRetryTransfer(err error) bool {
+	if err == nil || c.lifecycleSnapshot().Successful {
 		return false
 	}
 	if c.peerReconnectVersion < ReconnectVersion || c.reconnectVersion < ReconnectVersion {
@@ -801,11 +816,14 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 
 func (c *Client) transferWithReconnect(connectAttempt func(attempt int) error) error {
 	defer c.clearIncomingFileManifest()
-	var lastErr error
+	window := c.reconnectWindow()
 	var lastDisconnectErr error
-	for attempt := 0; attempt <= maxReconnectAttempts; attempt++ {
+	var deadline time.Time
+	retry := 0
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			delay := reconnectBackoff(attempt)
+			retry++
+			delay := reconnectBackoff(retry)
 			log.Debugf("reconnect attempt %d after %s", attempt, delay)
 			timer := time.NewTimer(delay)
 			select {
@@ -818,34 +836,64 @@ func (c *Client) transferWithReconnect(connectAttempt func(attempt int) error) e
 				return err
 			}
 		}
-		if err := connectAttempt(attempt); err != nil {
-			if attempt > 0 && lastDisconnectErr != nil {
-				return fmt.Errorf("%w (reconnect attempt %d failed: %v)", lastDisconnectErr, attempt, err)
+		err := connectAttempt(attempt)
+		connected := err == nil
+		if connected {
+			// Arm the watchdog only once the attempt owns its connection, so
+			// it can never fire early and leave the new connection unbounded.
+			stopWatchdog := func() bool { return false }
+			if attempt > 0 {
+				stopWatchdog = c.watchReconnectAttempt(deadline).Stop
 			}
-			lastErr = err
-		} else {
-			lastErr = c.transfer()
+			err = c.transfer()
+			stopWatchdog()
 		}
-		if lastErr == nil {
+		if err == nil {
 			return nil
 		}
-		log.Debugf("transfer attempt %d failed: %v", attempt, c.redactError(lastErr))
-		if attempt >= maxReconnectAttempts && isTransferDisconnectError(lastErr) {
-			return fmt.Errorf("transfer disconnected after %d reconnect attempts: %w", maxReconnectAttempts, lastErr)
+		log.Debugf("transfer attempt %d failed: %v", attempt, c.redactError(err))
+		if !c.canRetryTransfer(err) {
+			if !connected && lastDisconnectErr != nil {
+				return fmt.Errorf("%w (reconnect attempt %d failed: %v)", lastDisconnectErr, attempt, err)
+			}
+			return err
 		}
-		if !c.canRetryTransfer(lastErr, attempt) {
-			return lastErr
+		// The window measures a single outage: it starts at the first
+		// connection loss and restarts whenever a reconnect re-secures the
+		// channel, so a long transfer survives any number of separate drops.
+		if lastDisconnectErr == nil || c.lifecycleSnapshot().ChannelSecured {
+			lastDisconnectErr = err
+			deadline = time.Now().Add(window)
+			retry = 0
+			role := "Receiver"
+			if c.Options.IsSender {
+				role = "Sender"
+			}
+			output, colorEnabled := termui.Output(os.Stderr)
+			fmt.Fprintf(output, "\n%s detected a transfer interruption. %s\n", role,
+				termui.Warning(fmt.Sprintf("Retrying securely for up to %s...", window), colorEnabled))
+		} else if !time.Now().Before(deadline) {
+			return fmt.Errorf("could not reconnect within %s: %w (last attempt: %v)", window, lastDisconnectErr, err)
 		}
-		role := "Receiver"
-		if c.Options.IsSender {
-			role = "Sender"
-		}
-		output, colorEnabled := termui.Output(os.Stderr)
-		fmt.Fprintf(output, "\n%s detected a transfer interruption. %s\n", role, termui.Warning("Retrying securely...", colorEnabled))
-		lastDisconnectErr = lastErr
 		c.closeAttempt()
 	}
-	return fmt.Errorf("transfer disconnected after %d reconnect attempts: %w", maxReconnectAttempts, lastErr)
+}
+
+// watchReconnectAttempt closes the attempt's control connection when the
+// channel is not re-secured within reconnectSecureTimeout or by the reconnect
+// deadline. The blocked receive then fails as a retryable disconnect instead
+// of waiting on a relay room the peer may never reach.
+func (c *Client) watchReconnectAttempt(deadline time.Time) *time.Timer {
+	limit := min(reconnectSecureTimeout, time.Until(deadline))
+	return time.AfterFunc(limit, func() {
+		if c.lifecycleSnapshot().ChannelSecured {
+			return
+		}
+		log.Debug("reconnect attempt did not re-secure the channel in time")
+		if conn := c.connection(0); conn != nil {
+			conn.Close()
+		}
+	})
 }
 
 // TransferOptions for sending
@@ -1757,7 +1805,9 @@ func (c *Client) reconnectRelayAttempt(handshake func(*comm.Comm) error) error {
 		c.ExternalIP = ipaddr
 		return nil
 	}
-	return fmt.Errorf("could not reconnect to any relay: %s", strings.Join(reconnectErrors, "; "))
+	// The relay may be unreachable mid-outage, or the peer may not have
+	// rejoined yet; both are transient, so let the reconnect window retry.
+	return transferDisconnectError{err: fmt.Errorf("could not reconnect to any relay: %s", strings.Join(reconnectErrors, "; "))}
 }
 
 func (c *Client) senderReconnectRelayAttempt(attempt int) error {
@@ -2284,10 +2334,13 @@ func (c *Client) transfer() (err error) {
 			case reportedErr := <-attempt.errc:
 				err = reportedErr
 			default:
-				if !c.lifecycleSnapshot().ChannelSecured {
-					err = fmt.Errorf("could not secure channel")
-				} else if c.activeTransferStarted() {
+				// Once a transfer has started, any lost connection is a
+				// disconnect, including one that drops while a reconnect
+				// attempt is re-securing the channel.
+				if c.activeTransferStarted() {
 					err = transferDisconnectError{err: err}
+				} else if !c.lifecycleSnapshot().ChannelSecured {
+					err = fmt.Errorf("could not secure channel")
 				}
 			}
 			break

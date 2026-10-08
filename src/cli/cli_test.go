@@ -1176,6 +1176,62 @@ func TestApplyRememberedSendOptionsTransport(t *testing.T) {
 	}
 }
 
+func TestReconnectWindowOption(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		args       []string
+		env        string
+		remembered time.Duration
+		want       time.Duration
+		wantErr    string
+	}{
+		{name: "default", args: []string{"croc", "send"}, want: croc.DefaultReconnectWindow},
+		{name: "flag", args: []string{"croc", "--reconnect-window", "30m", "send"}, want: 30 * time.Minute},
+		{name: "environment", args: []string{"croc", "send"}, env: "45m", want: 45 * time.Minute},
+		{name: "inherits remembered", args: []string{"croc", "send"}, remembered: time.Hour, want: time.Hour},
+		{name: "flag overrides remembered", args: []string{"croc", "--reconnect-window", "5m", "send"}, remembered: time.Hour, want: 5 * time.Minute},
+		{name: "zero rejected", args: []string{"croc", "--reconnect-window", "0s", "send"}, wantErr: "must be positive"},
+		{name: "negative rejected", args: []string{"croc", "--reconnect-window", "-1m", "send"}, wantErr: "must be positive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("CROC_RECONNECT_WINDOW", test.env)
+			if test.env == "" {
+				os.Unsetenv("CROC_RECONNECT_WINDOW")
+			}
+			app := newApp()
+			for _, command := range app.Commands {
+				if command.Name != "send" {
+					continue
+				}
+				command.Action = func(ctx *cli.Context) error {
+					window, err := reconnectWindowOption(ctx)
+					if err != nil {
+						return err
+					}
+					options := croc.Options{ReconnectWindow: window}
+					applyRememberedSendOptions(ctx, &options, croc.Options{ReconnectWindow: test.remembered})
+					if options.ReconnectWindow != test.want {
+						t.Fatalf("ReconnectWindow = %s, want %s", options.ReconnectWindow, test.want)
+					}
+					return nil
+				}
+				err := app.Run(test.args)
+				if test.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+						t.Fatalf("error = %v, want %q", err, test.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			t.Fatal("send command not found")
+		})
+	}
+}
+
 func TestWriteTailcatRelayFallbackWarning(t *testing.T) {
 	for _, test := range []struct {
 		name       string

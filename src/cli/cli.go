@@ -216,6 +216,7 @@ func newApp() *cli.App {
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "SOCKS5 proxy address (relay DNS is resolved by the proxy)", EnvVars: []string{"SOCKS5_PROXY"}},
 		&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 		&cli.StringFlag{Name: "throttleUpload", Value: "", Usage: "throttle the upload speed e.g. 500k"},
+		&cli.DurationFlag{Name: "reconnect-window", Value: croc.DefaultReconnectWindow, Usage: "how long to keep retrying after a connection loss, e.g. 30m (set on both sender and receiver)", EnvVars: []string{"CROC_RECONNECT_WINDOW"}},
 	}
 	app.EnableBashCompletion = true
 	app.HideHelp = false
@@ -551,6 +552,9 @@ func applyRememberedSendOptions(c *cli.Context, options *croc.Options, remembere
 	if !c.IsSet("hash") {
 		options.HashAlgorithm = remembered.HashAlgorithm
 	}
+	if !c.IsSet("reconnect-window") && remembered.ReconnectWindow > 0 {
+		options.ReconnectWindow = remembered.ReconnectWindow
+	}
 	if !c.IsSet("git") {
 		options.GitIgnore = remembered.GitIgnore
 	}
@@ -597,6 +601,14 @@ func parseRelayPorts(portsFlag string) []string {
 	return ports
 }
 
+func reconnectWindowOption(c *cli.Context) (time.Duration, error) {
+	window := c.Duration("reconnect-window")
+	if window <= 0 {
+		return 0, fmt.Errorf("--reconnect-window must be positive, got %s", window)
+	}
+	return window, nil
+}
+
 func send(c *cli.Context) (err error) {
 	finishVersionCheck := startTransferVersionCheck(c)
 	defer finishVersionCheck()
@@ -614,6 +626,10 @@ func send(c *cli.Context) (err error) {
 	}
 	if stored {
 		return sendStored(c)
+	}
+	reconnectWindow, err := reconnectWindowOption(c)
+	if err != nil {
+		return err
 	}
 
 	portParam := c.Int("port")
@@ -676,6 +692,7 @@ func send(c *cli.Context) (err error) {
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		Transport:         transport,
+		ReconnectWindow:   reconnectWindow,
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -977,6 +994,10 @@ func receive(c *cli.Context) (err error) {
 		setDebugLevel(c)
 		return receiveStored(c, storedToken)
 	}
+	reconnectWindow, err := reconnectWindowOption(c)
+	if err != nil {
+		return err
+	}
 	crocOptions := croc.Options{
 		SharedSecret:      c.String("code"),
 		IsSender:          false,
@@ -998,6 +1019,7 @@ func receive(c *cli.Context) (err error) {
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		Transport:         croc.TransportAuto,
+		ReconnectWindow:   reconnectWindow,
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -1070,6 +1092,9 @@ Run croc with no argument and paste the link at the prompt, or use:
 		}
 		if !c.IsSet("local") {
 			crocOptions.OnlyLocal = rememberedOptions.OnlyLocal
+		}
+		if !c.IsSet("reconnect-window") && rememberedOptions.ReconnectWindow > 0 {
+			crocOptions.ReconnectWindow = rememberedOptions.ReconnectWindow
 		}
 		if !c.IsSet("relay") && strings.HasPrefix(rememberedOptions.RelayAddress, "non-default:") {
 			var rememberedAddr = strings.TrimPrefix(rememberedOptions.RelayAddress, "non-default:")
